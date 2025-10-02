@@ -12,7 +12,7 @@ class WalletDetailAPIView(APIView):
     """Get запрос, отпрвляем UUID кошелька, получаем """
     def get(self, request, wallet_uuid):
         try:
-            wallet = get_object_or_404(Wallet, id=wallet_uuid)
+            wallet = get_object_or_404(Wallet, pk=wallet_uuid)
             serializer = WalletSerializer(wallet)
             return Response(serializer.data)
         except Exception as e:
@@ -26,7 +26,6 @@ class WalletOperationsAPIView(APIView):
     """POST запрос, получаем json операции, по тому какая операция проходит бизнес логика.
 
     Валидация UUID кошелька, а так же формата UUID.
-
 
     """
     @transaction.atomic
