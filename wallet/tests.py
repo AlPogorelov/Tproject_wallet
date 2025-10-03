@@ -1,4 +1,5 @@
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from django.test import TestCase
 from django.urls import reverse
@@ -92,7 +93,7 @@ class SerializerTests(TestCase):
 class WalletAPITests(APITestCase):
     """Проврка на API и эндпоиты"""
     def setUp(self):
-        """Создаем операции и APICliet"""
+        """Создаем операции и APIClient"""
         self.client = APIClient()
         self.wallet = Wallet.objects.create()
         self.operation_url = reverse('wallet:wallet_operation', kwargs={'wallet_uuid': self.wallet.id})
