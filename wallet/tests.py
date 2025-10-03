@@ -32,9 +32,9 @@ class WalletModelTests(TestCase):
 
     def test_amount_negative(self):
         """Проверка на то что балланс не может быть отрицательным"""
+        self.wallet.amount = Decimal('-1512.00')
         with self.assertRaises(Exception):
-            self.wallet.amount = Decimal('-1512.00')
-            self.wallet.save()
+            self.wallet.full_clean()
 
 
 class SerializerTests(TestCase):
@@ -113,7 +113,10 @@ class WalletAPITests(APITestCase):
 
         response = self.client.get(operation_amount_non)
 
-        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        if response.status_code != 404:
+            print(f"Get non-wallet error: {response.data}")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_deposit(self):
         """Проверяем способность пополнения кошелька """
@@ -126,6 +129,8 @@ class WalletAPITests(APITestCase):
 
         for operation in operations:
             response = self.client.post(self.operation_url, operation, format="json")
+            if response.status_code != 200:
+                print(f"Deposit error: {response.data}")
             self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         self.wallet.refresh_from_db()
@@ -133,10 +138,16 @@ class WalletAPITests(APITestCase):
 
     def test_withdraw(self):
         """Проверяем работу снятия средств"""
+
+        deposit_operations = {'operation_type': 'DEPOSIT', 'amount': '600.00'}
+
+        response = self.client.post(self.operation_url, deposit_operations, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
         operations = [
-            {'operation_type': 'DEPOSIT', 'amount': '100.00'},
-            {'operation_type': 'DEPOSIT', 'amount': '100.00'},
-            {'operation_type': 'DEPOSIT', 'amount': '100.00'},
+            {'operation_type': 'WITHDRAW', 'amount': '100.00'},
+            {'operation_type': 'WITHDRAW', 'amount': '100.00'},
+            {'operation_type': 'WITHDRAW', 'amount': '100.00'},
         ]
 
         for operation in operations:
@@ -155,14 +166,4 @@ class WalletAPITests(APITestCase):
 
         response = self.client.post(self.operation_url, operation, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-
-class WalletLogicTests(APITestCase):
-    """Проверка бизнес логики"""
-    def setUp(self):
-        """Создаем операции и APICliet"""
-        self.client = APIClient()
-        self.wallet = Wallet.objects.create()
-        self.operation_url = reverse('wallet:wallet_operation', kwargs={'wallet_uuid': self.wallet.id})
-
 
