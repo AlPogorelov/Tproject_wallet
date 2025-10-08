@@ -1,6 +1,10 @@
+import threading
 import uuid
+import time
+import atexit
+from django.db import transaction, connections
 from decimal import Decimal
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from rest_framework import status
 
@@ -8,6 +12,22 @@ from rest_framework.test import APITestCase, APIClient
 
 from wallet.models import Wallet
 from wallet.serializers import WalletSerializer, WalletOperationSerializer
+
+
+class DatabaseCleanupMixin:
+    """Миксин для очистки соединений с БД после тестов"""
+    def tearDown(self):
+        super().tearDown()
+        connections.close_all()
+
+
+def close_all_connections():
+    """Функция для закрытия всех соединений с БД"""
+    for conn in connections.all():
+        conn.close()
+
+
+atexit.register(close_all_connections)
 
 
 class WalletModelTests(TestCase):
@@ -32,9 +52,9 @@ class WalletModelTests(TestCase):
 
     def test_amount_negative(self):
         """Проверка на то что балланс не может быть отрицательным"""
+        self.wallet.amount = Decimal('-1512.00')
         with self.assertRaises(Exception):
-            self.wallet.amount = Decimal('-1512.00')
-            self.wallet.save()
+            self.wallet.full_clean()
 
 
 class SerializerTests(TestCase):
@@ -92,7 +112,7 @@ class SerializerTests(TestCase):
 class WalletAPITests(APITestCase):
     """Проврка на API и эндпоиты"""
     def setUp(self):
-        """Создаем операции и APICliet"""
+        """Создаем операции и APIClient"""
         self.client = APIClient()
         self.wallet = Wallet.objects.create()
         self.operation_url = reverse('wallet:wallet_operation', kwargs={'wallet_uuid': self.wallet.id})
@@ -113,7 +133,10 @@ class WalletAPITests(APITestCase):
 
         response = self.client.get(operation_amount_non)
 
-        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        if response.status_code != 404:
+            print(f"Get non-wallet error: {response.data}")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_deposit(self):
         """Проверяем способность пополнения кошелька """
@@ -126,6 +149,8 @@ class WalletAPITests(APITestCase):
 
         for operation in operations:
             response = self.client.post(self.operation_url, operation, format="json")
+            if response.status_code != 200:
+                print(f"Deposit error: {response.data}")
             self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         self.wallet.refresh_from_db()
@@ -133,10 +158,16 @@ class WalletAPITests(APITestCase):
 
     def test_withdraw(self):
         """Проверяем работу снятия средств"""
+
+        deposit_operations = {'operation_type': 'DEPOSIT', 'amount': '600.00'}
+
+        response = self.client.post(self.operation_url, deposit_operations, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
         operations = [
-            {'operation_type': 'DEPOSIT', 'amount': '100.00'},
-            {'operation_type': 'DEPOSIT', 'amount': '100.00'},
-            {'operation_type': 'DEPOSIT', 'amount': '100.00'},
+            {'operation_type': 'WITHDRAW', 'amount': '100.00'},
+            {'operation_type': 'WITHDRAW', 'amount': '100.00'},
+            {'operation_type': 'WITHDRAW', 'amount': '100.00'},
         ]
 
         for operation in operations:
@@ -157,12 +188,177 @@ class WalletAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class WalletLogicTests(APITestCase):
-    """Проверка бизнес логики"""
+class WalletConcurrentTests(TransactionTestCase, DatabaseCleanupMixin):
+    """Проверяем конкурентную среду"""
     def setUp(self):
-        """Создаем операции и APICliet"""
-        self.client = APIClient()
-        self.wallet = Wallet.objects.create()
+        """Создаем операции и APIClient"""
+        with transaction.atomic():
+            self.wallet = Wallet.objects.create(amount=Decimal('1000.00'))
+        self.operation_url = reverse('wallet:wallet_operation', kwargs={'wallet_uuid': self.wallet.id})
+        self.operation_amount = reverse('wallet:wallet_amount', kwargs={'wallet_uuid': self.wallet.id})
+
+    def test_concurrent_deposits(self):
+        """Тест конкурентных пополнений кошелька"""
+        initial_amount = self.wallet.amount
+        deposit_amount = Decimal('100.00')
+        num_threads = 5
+        expected_final_amount = initial_amount + (deposit_amount * num_threads)
+
+        def deposit_operation():
+            from django.db import connection
+            try:
+                client = APIClient()
+                operation = {
+                    'operation_type': 'DEPOSIT',
+                    'amount': '100.00'
+                }
+                response = client.post(self.operation_url, operation, format="json")
+                if response.status_code != 200:
+                    print(f"Deposit error in thread: {response.data}")
+            except Exception as e:
+                print(f"Exception in thread: {str(e)}")
+            finally:
+                connection.close()
+
+        threads = []
+        for i in range(num_threads):
+            thread = threading.Thread(target=deposit_operation, name=f"DepositThread-{i}")
+            threads.append(thread)
+
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
+        time.sleep(0.5)
+
+        self.wallet.refresh_from_db()
+        self.assertEqual(
+            self.wallet.amount,
+            expected_final_amount,
+            f"Ожидалось: {expected_final_amount}, получено: {self.wallet.amount}")
+
+    def test_concurrent_withdrawals(self):
+        """Тест конкурентных списаний с кошелька"""
+        with transaction.atomic():
+            self.wallet.amount = Decimal('1000.00')
+            self.wallet.save()
+
+        withdrawal_amount = Decimal('100.00')
+        num_threads = 5
+        expected_final_amount = Decimal('1000.00') - (withdrawal_amount * num_threads)
+
+        def withdraw_operation():
+            from django.db import connection
+            try:
+                client = APIClient()
+                operation = {
+                    'operation_type': 'WITHDRAW',
+                    'amount': '100.00'
+                }
+                response = client.post(self.operation_url, operation, format="json")
+                if response.status_code != 200:
+                    print(f"Withdraw error in thread: {response.data}")
+            except Exception as e:
+                print(f"Exception in thread: {str(e)}")
+            finally:
+                connection.close()
+
+        threads = []
+        for i in range(num_threads):
+            thread = threading.Thread(target=withdraw_operation, name=f"WithdrawThread-{i}")
+            threads.append(thread)
+
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
+        time.sleep(0.5)
+        self.wallet.refresh_from_db()
+        self.assertEqual(
+            self.wallet.amount,
+            expected_final_amount,
+            f"Ожидалось: {expected_final_amount}, получено: {self.wallet.amount}")
+
+
+class WalletModelConcurrentTests(TransactionTestCase, DatabaseCleanupMixin):
+    """Тесты модели в конкурентной среде"""
+
+    def setUp(self):
+        with transaction.atomic():
+            self.wallet = Wallet.objects.create(amount=Decimal('1000.00'))
+
+    def test_concurrent_atomic_updates(self):
+        """Тест атомарных обновлений через F()"""
+        num_threads = 10
+        barrier = threading.Barrier(num_threads)
+
+        def update_wallet(thread_id):
+            barrier.wait()
+
+            try:
+                with transaction.atomic():
+                    wallet = Wallet.objects.select_for_update().get(id=self.wallet.id)
+                    wallet.amount += Decimal('100.00')
+                    wallet.save()
+            except Exception as e:
+                print(f"Error in thread {thread_id}: {str(e)}")
+
+        threads = []
+        for i in range(num_threads):
+            thread = threading.Thread(target=update_wallet, args=(i,), name=f"ModelThread-{i}")
+            threads.append(thread)
+
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
+        time.sleep(0.5)
+        self.wallet.refresh_from_db()
+
+        expected_amount = Decimal('2000.00')
+        self.assertEqual(self.wallet.amount, expected_amount)
+
+
+class SimpleConcurrentTests(TransactionTestCase, DatabaseCleanupMixin):
+    """Упрощенные тесты для отладки"""
+
+    def setUp(self):
+        with transaction.atomic():
+            self.wallet = Wallet.objects.create(amount=Decimal('1000.00'))
         self.operation_url = reverse('wallet:wallet_operation', kwargs={'wallet_uuid': self.wallet.id})
 
+    def test_single_deposit(self):
+        """Простой тест одного пополнения"""
+        client = APIClient()
+        operation = {
+            'operation_type': 'DEPOSIT',
+            'amount': '100.00'
+        }
+        response = client.post(self.operation_url, operation, format="json")
+        self.assertEqual(response.status_code, 200)
 
+        self.wallet.refresh_from_db()
+        self.assertEqual(self.wallet.amount, Decimal('1100.00'))
+
+    def test_two_sequential_deposits(self):
+        """Тест двух последовательных пополнений"""
+        client = APIClient()
+
+        # Первое пополнение
+        operation1 = {'operation_type': 'DEPOSIT', 'amount': '100.00'}
+        response1 = client.post(self.operation_url, operation1, format="json")
+        self.assertEqual(response1.status_code, 200)
+
+        # Второе пополнение
+        operation2 = {'operation_type': 'DEPOSIT', 'amount': '200.00'}
+        response2 = client.post(self.operation_url, operation2, format="json")
+        self.assertEqual(response2.status_code, 200)
+
+        self.wallet.refresh_from_db()
+        self.assertEqual(self.wallet.amount, Decimal('1300.00'))

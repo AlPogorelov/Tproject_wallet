@@ -1,3 +1,4 @@
+from django.db.models import F
 from rest_framework import status
 from django.shortcuts import get_object_or_404
 from django.db import transaction
@@ -11,15 +12,15 @@ from wallet.serializers import WalletSerializer, WalletOperationSerializer
 class WalletDetailAPIView(APIView):
     """Get запрос, отпрвляем UUID кошелька, получаем """
     def get(self, request, wallet_uuid):
-        try:
-            wallet = get_object_or_404(Wallet, pk=wallet_uuid)
-            serializer = WalletSerializer(wallet)
-            return Response(serializer.data)
-        except Exception as e:
-            return Response(
-                {'error': f'Ошибка при получении кошелька: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        wallet = get_object_or_404(Wallet, pk=wallet_uuid)
+        serializer = WalletSerializer(wallet)
+        return Response(serializer.data)
+
+        print(f"Error in WalletDetailAPIView: {str(e)}")
+        return Response(
+            {'error': 'Internal server error'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 class WalletOperationsAPIView(APIView):
@@ -31,7 +32,7 @@ class WalletOperationsAPIView(APIView):
     @transaction.atomic
     def post(self, request, wallet_uuid):
         try:
-            wallet = Wallet.objects.get(id=wallet_uuid)
+            wallet = Wallet.objects.select_for_update().get(id=wallet_uuid)
 
         except Wallet.DoesNotExist:
             return Response(
@@ -58,18 +59,16 @@ class WalletOperationsAPIView(APIView):
 
         try:
             if operation_type == 'DEPOSIT':
-                wallet.amount += amount
-                wallet.save()
+                Wallet.objects.filter(id=wallet_uuid).update(amount=F('amount') + amount)
+
                 response_message = "Кошелек пополнен"
 
             elif operation_type == 'WITHDRAW':
                 if wallet.amount < amount:
-                    return Response(
-                        {'error': 'Недостаточно средств на счете'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                wallet.amount -= amount
-                wallet.save()
+                    return Response({'error': 'Недостаточно средств на счете'},status=status.HTTP_400_BAD_REQUEST)
+
+                Wallet.objects.filter(id=wallet_uuid).update(amount=F('amount') - amount)
+
                 response_message = "Средства успешно сняты"
 
             wallet.refresh_from_db()
@@ -80,6 +79,7 @@ class WalletOperationsAPIView(APIView):
             })
 
         except Exception as e:
+            print(f"Error in WalletOperationAPIView: {str(e)}")
             return Response(
                 {'error': f'Ошибка при выполнении операции: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
